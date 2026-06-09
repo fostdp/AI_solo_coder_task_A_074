@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LNG储罐翻滚预测与安全监控系统</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <header id="app-header">
+        <div class="header-left">
+            <h1>LNG储罐翻滚预测与安全监控系统</h1>
+            <span class="system-status" id="system-status">系统运行中</span>
+        </div>
+        <div class="header-right">
+            <span id="current-time"></span>
+            <span class="ws-status" id="ws-status">WS: 未连接</span>
+        </div>
+    </header>
+
+    <main id="app-main">
+        <nav id="tank-nav">
+            <div class="nav-title">储罐选择</div>
+            <div id="tank-buttons"></div>
+            <div class="nav-section">
+                <div class="nav-title">告警汇总</div>
+                <div id="alarm-summary"></div>
+            </div>
+            <div class="nav-section">
+                <div class="nav-title">风险指数</div>
+                <div id="risk-gauge-container">
+                    <canvas id="risk-gauge" width="200" height="120"></canvas>
+                    <div id="risk-value"></div>
+                </div>
+            </div>
+            <div class="nav-section">
+                <div class="nav-title">预测信息</div>
+                <div id="prediction-info"></div>
+            </div>
+        </nav>
+
+        <section id="tank-view">
+            <div id="three-container">
+                <canvas id="tank-3d"></canvas>
+            </div>
+            <div id="density-contour-container">
+                <canvas id="density-contour"></canvas>
+            </div>
+        </section>
+
+        <aside id="data-panel">
+            <div class="panel-section">
+                <h3>温度分层 (°C)</h3>
+                <div id="temp-layers"></div>
+            </div>
+            <div class="panel-section">
+                <h3>密度分布 (kg/m³)</h3>
+                <div id="density-layers"></div>
+            </div>
+            <div class="panel-section">
+                <h3>罐顶参数</h3>
+                <div id="top-params">
+                    <div class="param-row">
+                        <span>压力:</span>
+                        <span id="pressure-val">-- kPa</span>
+                    </div>
+                    <div class="param-row">
+                        <span>设计压力:</span>
+                        <span id="design-pressure-val">-- kPa</span>
+                    </div>
+                    <div class="param-row">
+                        <span>压力比:</span>
+                        <span id="pressure-ratio">--%</span>
+                    </div>
+                    <div class="param-row">
+                        <span>BOG压缩机:</span>
+                        <span id="bog-status">--</span>
+                    </div>
+                </div>
+            </div>
+            <div class="panel-section">
+                <h3>最近告警</h3>
+                <div id="recent-alarms"></div>
+            </div>
+        </aside>
+    </main>
+
+    <div id="sensor-popup" class="popup hidden">
+        <div class="popup-header">
+            <span id="popup-title">传感器详情</span>
+            <button class="popup-close" onclick="closeSensorPopup()">&times;</button>
+        </div>
+        <div class="popup-body">
+            <div id="popup-info"></div>
+            <div id="popup-risk"></div>
+            <canvas id="trend-chart" width="480" height="240"></canvas>
+        </div>
+    </div>
+
+    <div id="alarm-banner" class="alarm-banner hidden"></div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="/js/app.js"></script>
+    <script src="/js/tank3d.js"></script>
+    <script src="/js/density.js"></script>
+    <script src="/js/charts.js"></script>
+    <script src="/js/alarm.js"></script>
+    <script src="/js/main.js"></script>
+</body>
+</html>
