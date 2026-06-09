@@ -1,7 +1,4 @@
 document.addEventListener('DOMContentLoaded', () => {
-    Tank3D.init();
-    DensityContour.init();
-
     App.init().then(() => {
         console.log('LNG储罐翻滚预测与安全监控系统 已启动');
     }).catch(err => {
