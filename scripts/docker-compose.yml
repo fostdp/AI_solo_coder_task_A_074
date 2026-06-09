@@ -3,6 +3,7 @@ version: '3.8'
 services:
   timescaledb:
     image: timescale/timescaledb:latest-pg15
+    container_name: lng-timescaledb
     ports:
       - "5432:5432"
     environment:
@@ -11,42 +12,78 @@ services:
       POSTGRES_DB: lng_monitor
     volumes:
       - timescaledb_data:/var/lib/postgresql/data
-      - ../scripts/init_timescaledb.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./init_timescaledb.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+    networks:
+      - lng-net
+    restart: unless-stopped
 
   backend:
     build:
       context: ../backend
       dockerfile: Dockerfile
+    container_name: lng-backend
     ports:
       - "8080:8080"
+      - "6060:6060"
     environment:
       DB_HOST: timescaledb
       DB_PORT: 5432
       DB_USER: postgres
       DB_PASSWORD: postgres
       DB_NAME: lng_monitor
-      MODBUS_HOST: simulator
+      MODBUS_HOST: modbus-simulator
       MODBUS_PORT: 5020
-      OPCUA_ENDPOINT: opc.tcp://localhost:4840
+      OPCUA_ENDPOINT: opc.tcp://opcua-simulator:4840/LNG/DCS
       STATIC_DIR: /app/static
       HTTP_PORT: 8080
+      MODEL_PARAMS_PATH: /app/configs/model_params.json
     depends_on:
       timescaledb:
         condition: service_healthy
     volumes:
-      - ../frontend/static:/app/static
+      - ../frontend/static:/app/static:ro
+    networks:
+      - lng-net
+    restart: unless-stopped
 
-  simulator:
+  modbus-simulator:
     build:
-      context: ../scripts
+      context: .
       dockerfile: Dockerfile.sim
+    container_name: lng-modbus-sim
     ports:
       - "5020:5020"
+      - "8090:8090"
+    environment:
+      MODBUS_PORT: "5020"
+      HTTP_API_PORT: "8090"
+      NUM_TANKS: "4"
+      UPDATE_INTERVAL: "30"
+    networks:
+      - lng-net
+    restart: unless-stopped
+
+  opcua-simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile.opcua
+    container_name: lng-opcua-sim
+    ports:
+      - "4840:4840"
+    environment:
+      OPCUA_PORT: "4840"
+    networks:
+      - lng-net
+    restart: unless-stopped
 
 volumes:
   timescaledb_data:
+
+networks:
+  lng-net:
+    driver: bridge

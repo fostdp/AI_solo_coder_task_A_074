@@ -2,5 +2,5 @@ FROM python:3.11-slim
 WORKDIR /app
 RUN pip install --no-cache-dir pymodbus
 COPY modbus_simulator.py .
-EXPOSE 5020
+EXPOSE 5020 8090
 CMD ["python", "modbus_simulator.py"]

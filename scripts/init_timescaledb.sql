@@ -158,6 +158,59 @@ SELECT add_retention_policy('temperature_readings', INTERVAL '90 days', if_not_e
 SELECT add_retention_policy('density_readings', INTERVAL '90 days', if_not_exists => TRUE);
 SELECT add_retention_policy('pressure_readings', INTERVAL '90 days', if_not_exists => TRUE);
 SELECT add_retention_policy('bog_compressor_status', INTERVAL '90 days', if_not_exists => TRUE);
+SELECT add_retention_policy('rollover_predictions', INTERVAL '365 days', if_not_exists => TRUE);
+
+-- 自动压缩策略 (7天以上的数据块自动压缩, 节省存储)
+ALTER TABLE temperature_readings SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'tank_id, layer_index',
+    timescaledb.compress_orderby = 'time DESC'
+);
+SELECT add_compression_policy('temperature_readings', INTERVAL '7 days', if_not_exists => TRUE);
+
+ALTER TABLE density_readings SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'tank_id, layer_index',
+    timescaledb.compress_orderby = 'time DESC'
+);
+SELECT add_compression_policy('density_readings', INTERVAL '7 days', if_not_exists => TRUE);
+
+ALTER TABLE pressure_readings SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'tank_id',
+    timescaledb.compress_orderby = 'time DESC'
+);
+SELECT add_compression_policy('pressure_readings', INTERVAL '7 days', if_not_exists => TRUE);
+
+ALTER TABLE bog_compressor_status SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'tank_id',
+    timescaledb.compress_orderby = 'time DESC'
+);
+SELECT add_compression_policy('bog_compressor_status', INTERVAL '7 days', if_not_exists => TRUE);
+
+ALTER TABLE rollover_predictions SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'tank_id',
+    timescaledb.compress_orderby = 'time DESC'
+);
+SELECT add_compression_policy('rollover_predictions', INTERVAL '7 days', if_not_exists => TRUE);
+
+-- 连续聚合保留策略 (聚合数据保留2年)
+SELECT add_retention_policy('temperature_layer_hourly', INTERVAL '730 days', if_not_exists => TRUE);
+SELECT add_retention_policy('density_layer_hourly', INTERVAL '730 days', if_not_exists => TRUE);
+
+-- 刷新连续聚合的策略 (每1小时自动刷新)
+SELECT add_continuous_aggregate_policy('temperature_layer_hourly',
+    start_offset => INTERVAL '3 hours',
+    end_offset => INTERVAL '1 hour',
+    schedule_interval => INTERVAL '1 hour',
+    if_not_exists => TRUE);
+SELECT add_continuous_aggregate_policy('density_layer_hourly',
+    start_offset => INTERVAL '3 hours',
+    end_offset => INTERVAL '1 hour',
+    schedule_interval => INTERVAL '1 hour',
+    if_not_exists => TRUE);
 
 -- 插入4座16万立方米储罐基础数据
 INSERT INTO tanks (tank_code, volume_m3, design_pressure_kpa, height_m, diameter_m, status) VALUES

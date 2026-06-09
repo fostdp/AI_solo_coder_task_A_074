@@ -1,9 +1,11 @@
 package api
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -91,32 +93,97 @@ func NewServer(cfg *config.Config, db *database.DB) *Server {
 func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/api/tanks", s.handleGetTanks)
-	mux.HandleFunc("/api/tank/", s.handleTankData)
-	mux.HandleFunc("/api/sensor/", s.handleSensorTrend)
-	mux.HandleFunc("/api/alarm/", s.handleAlarmAction)
-	mux.HandleFunc("/api/alarms/", s.handleTankAlarms)
-	mux.HandleFunc("/api/prediction/", s.handlePrediction)
+	mux.HandleFunc("/api/tanks", s.wrapWithMetrics(s.handleGetTanks))
+	mux.HandleFunc("/api/tank/", s.wrapWithMetrics(s.handleTankData))
+	mux.HandleFunc("/api/sensor/", s.wrapWithMetrics(s.handleSensorTrend))
+	mux.HandleFunc("/api/alarm/", s.wrapWithMetrics(s.handleAlarmAction))
+	mux.HandleFunc("/api/alarms/", s.wrapWithMetrics(s.handleTankAlarms))
+	mux.HandleFunc("/api/prediction/", s.wrapWithMetrics(s.handlePrediction))
 	mux.HandleFunc("/ws", s.handleWebSocket)
 
+	registerMetricsAndPprof(mux)
+
 	mux.HandleFunc("/", s.serveFrontend)
+
+	handler := gzipMiddleware(mux)
 
 	addr := fmt.Sprintf(":%d", s.cfg.HTTPPort)
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: mux,
+		Handler: handler,
 	}
+
+	pprofAddr := ":6060"
+	pprofmux := http.NewServeMux()
+	pprofmux.HandleFunc("/debug/pprof/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<html><body><h1>pprof</h1><a href="/debug/pprof/goroutine">goroutine</a><br><a href="/debug/pprof/heap">heap</a><br><a href="/debug/pprof/profile?seconds=30">profile (30s)</a><br><a href="/debug/pprof/trace">trace</a></body></html>`)
+	})
+	pprofSrv := &http.Server{Addr: pprofAddr, Handler: pprofmux}
+	go pprofSrv.ListenAndServe()
+	log.Printf("pprof server on %s", pprofAddr)
 
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		srv.Shutdown(shutdownCtx)
+		pprofSrv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("API server starting on %s", addr)
+	log.Printf("API server starting on %s (gzip enabled)", addr)
 	return srv.ListenAndServe()
 }
+
+func (s *Server) wrapWithMetrics(fn http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		IncRequests()
+		fn(w, r)
+	}
+}
+
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	gw *gzip.Writer
+}
+
+func (w *gzipResponseWriter) Write(b []byte) (int, error) {
+	return w.gw.Write(b)
+}
+
+func (w *gzipResponseWriter) WriteHeader(statusCode int) {
+	w.ResponseWriter.Header().Del("Content-Length")
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func gzipMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if isGzipExcluded(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		w.Header().Set("Content-Encoding", "gzip")
+		gz := gzip.NewWriter(w)
+		defer gz.Close()
+
+		gzw := &gzipResponseWriter{ResponseWriter: w, gw: gz}
+		next.ServeHTTP(gzw, r)
+	})
+}
+
+func isGzipExcluded(path string) bool {
+	return strings.HasPrefix(path, "/ws") ||
+		strings.HasPrefix(path, "/debug/") ||
+		strings.HasPrefix(path, "/metrics")
+}
+
+var _ io.Writer = (*gzipResponseWriter)(nil)
 
 func (s *Server) BroadcastMessage(msg models.WSMessage) {
 	s.wsHub.Broadcast(msg)

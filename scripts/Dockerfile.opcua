@@ -1,0 +1,6 @@
+FROM python:3.11-slim
+WORKDIR /app
+RUN pip install --no-cache-dir asyncua
+COPY opcua_simulator.py .
+EXPOSE 4840
+CMD ["python", "opcua_simulator.py"]
