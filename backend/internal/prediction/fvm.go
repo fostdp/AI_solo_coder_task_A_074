@@ -19,7 +19,17 @@ const (
 	LNGKinematicVisc    = 2.7e-7
 	GravitationalAccel  = 9.81
 	LNGThermalExpansion = 3.6e-3
-	ModelVersion        = "fvm-v1"
+	ModelVersion        = "fvm-v1.1"
+
+	AlphaTempRelax    = 0.6
+	AlphaDensityRelax = 0.5
+	CFLLimit          = 0.45
+	MinTimeStep       = 0.1
+	MaxTimeStep       = 30.0
+	MaxSubIterations  = 20
+	ConvergenceTol    = 1e-4
+	MaxTempChange     = 0.5
+	MaxDensityChange  = 0.2
 )
 
 type FiniteVolumeModel struct {
@@ -33,12 +43,14 @@ type FiniteVolumeModel struct {
 	previousTemp    [NumLayers]float64
 	previousDensity [NumLayers]float64
 
-	timeStep       float64
+	effectiveTimeStep float64
 	tankHeight     float64
 	tankVolume     float64
 
 	tempHistory    [][]float64
 	densityHistory [][]float64
+
+	lastResidual float64
 }
 
 type PredictionResult struct {
@@ -54,11 +66,11 @@ func NewFiniteVolumeModel(cfg *config.Config, db *database.DB) *FiniteVolumeMode
 	layerH := tankHeight / NumLayers
 
 	fvm := &FiniteVolumeModel{
-		cfg:        cfg,
-		db:         db,
-		tankHeight: tankHeight,
-		tankVolume: 160000.0,
-		timeStep:   float64(cfg.DataIntervalSec),
+		cfg:              cfg,
+		db:               db,
+		tankHeight:       tankHeight,
+		tankVolume:       160000.0,
+		effectiveTimeStep: float64(cfg.DataIntervalSec),
 	}
 
 	for i := 0; i < NumLayers; i++ {
@@ -88,7 +100,7 @@ func (fvm *FiniteVolumeModel) Start(ctx context.Context) {
 			}
 		}
 	}()
-	log.Println("rollover prediction model started")
+	log.Println("rollover prediction model started (v1.1 with under-relaxation + adaptive dt)")
 }
 
 func (fvm *FiniteVolumeModel) runPredictionCycle(ctx context.Context) {
@@ -116,7 +128,9 @@ func (fvm *FiniteVolumeModel) runPredictionCycle(ctx context.Context) {
 			log.Printf("prediction: insert error tank=%d: %v", tank.ID, err)
 		}
 
-		log.Printf("prediction: tank=%s risk=%.3f stability=%.3f", tank.TankCode, result.RiskIndex, result.StabilityScore)
+		log.Printf("prediction: tank=%s risk=%.3f stability=%.3f dt=%.2f residual=%.2e",
+			tank.TankCode, result.RiskIndex, result.StabilityScore,
+			fvm.effectiveTimeStep, fvm.lastResidual)
 	}
 }
 
@@ -132,6 +146,9 @@ func (fvm *FiniteVolumeModel) predict(ctx context.Context, tankID int) Predictio
 	fvm.previousTemp = fvm.layerTemp
 	fvm.previousDensity = fvm.layerDensity
 
+	rawTemp := fvm.layerTemp
+	rawDensity := fvm.layerDensity
+
 	layerTempAvg := make(map[int]float64)
 	layerTempCount := make(map[int]int)
 	for _, t := range temps {
@@ -141,7 +158,7 @@ func (fvm *FiniteVolumeModel) predict(ctx context.Context, tankID int) Predictio
 	for k, v := range layerTempAvg {
 		idx := k - 1
 		if idx >= 0 && idx < NumLayers {
-			fvm.layerTemp[idx] = v / float64(layerTempCount[k])
+			rawTemp[idx] = v / float64(layerTempCount[k])
 		}
 	}
 
@@ -154,8 +171,13 @@ func (fvm *FiniteVolumeModel) predict(ctx context.Context, tankID int) Predictio
 	for k, v := range layerDensityAvg {
 		idx := k - 1
 		if idx >= 0 && idx < NumLayers {
-			fvm.layerDensity[idx] = v / float64(layerDensityCount[k])
+			rawDensity[idx] = v / float64(layerDensityCount[k])
 		}
+	}
+
+	for i := 0; i < NumLayers; i++ {
+		fvm.layerTemp[i] = fvm.previousTemp[i] + AlphaTempRelax*(rawTemp[i]-fvm.previousTemp[i])
+		fvm.layerDensity[i] = fvm.previousDensity[i] + AlphaDensityRelax*(rawDensity[i]-fvm.previousDensity[i])
 	}
 
 	tempSlice := make([]float64, NumLayers)
@@ -170,6 +192,22 @@ func (fvm *FiniteVolumeModel) predict(ctx context.Context, tankID int) Predictio
 	}
 
 	return fvm.computePrediction(tankID)
+}
+
+func (fvm *FiniteVolumeModel) computeAdaptiveTimeStep(alpha float64) float64 {
+	dx := fvm.layerHeight[0]
+	cflDt := CFLLimit * dx * dx / alpha
+
+	dt := math.Min(cflDt, MaxTimeStep)
+	dt = math.Max(dt, MinTimeStep)
+
+	if fvm.lastResidual > 1e-2 {
+		dt = math.Max(MinTimeStep, dt*0.5)
+	} else if fvm.lastResidual < 1e-6 {
+		dt = math.Min(MaxTimeStep, dt*1.5)
+	}
+
+	return dt
 }
 
 func (fvm *FiniteVolumeModel) computePrediction(tankID int) PredictionResult {
@@ -190,10 +228,6 @@ func (fvm *FiniteVolumeModel) computePrediction(tankID int) PredictionResult {
 
 	maxLayerTempDiff := 0.0
 	maxLayerDensDiff := 0.0
-	minTemp := math.Inf(1)
-	maxTemp := math.Inf(-1)
-	minDens := math.Inf(1)
-	maxDens := math.Inf(-1)
 
 	for i := 0; i < NumLayers; i++ {
 		for j := i + 1; j < NumLayers; j++ {
@@ -205,18 +239,6 @@ func (fvm *FiniteVolumeModel) computePrediction(tankID int) PredictionResult {
 			if dd > maxLayerDensDiff {
 				maxLayerDensDiff = dd
 			}
-		}
-		if fvm.layerTemp[i] < minTemp {
-			minTemp = fvm.layerTemp[i]
-		}
-		if fvm.layerTemp[i] > maxTemp {
-			maxTemp = fvm.layerTemp[i]
-		}
-		if fvm.layerDensity[i] < minDens {
-			minDens = fvm.layerDensity[i]
-		}
-		if fvm.layerDensity[i] > maxDens {
-			maxDens = fvm.layerDensity[i]
 		}
 	}
 
@@ -236,8 +258,8 @@ func (fvm *FiniteVolumeModel) computePrediction(tankID int) PredictionResult {
 
 	stabilityScore := 1.0 - riskIndex
 
-	fvm.solveHeatDiffusion()
-	fvm.solveMassDiffusion()
+	fvm.solveHeatDiffusionAdaptive()
+	fvm.solveMassDiffusionAdaptive()
 
 	driftRate := fvm.computeInstabilityDriftRate()
 	var predictedRollover *time.Time
@@ -282,53 +304,116 @@ func (fvm *FiniteVolumeModel) computeRayleighNumberDensity(deltaRho float64) flo
 	return ra
 }
 
-func (fvm *FiniteVolumeModel) solveHeatDiffusion() {
-	dt := fvm.timeStep
+func (fvm *FiniteVolumeModel) solveHeatDiffusionAdaptive() {
 	k := LNGThermalConduct
 	rho := fvm.layerDensity[2]
 	cp := LNGSpecificHeat
-	alpha := k / (rho * cp)
+	thermalDiffusivity := k / (rho * cp)
 
-	newTemp := fvm.layerTemp
+	dt := fvm.computeAdaptiveTimeStep(thermalDiffusivity)
+	fvm.effectiveTimeStep = dt
 
-	for i := 1; i < NumLayers-1; i++ {
-		dx := fvm.layerHeight[i]
-		d2Tdx2 := (fvm.layerTemp[i+1] - 2*fvm.layerTemp[i] + fvm.layerTemp[i-1]) / (dx * dx)
-		newTemp[i] = fvm.layerTemp[i] + alpha*dt*d2Tdx2
+	saved := fvm.layerTemp
+	prevIter := fvm.layerTemp
+
+	for iter := 0; iter < MaxSubIterations; iter++ {
+		rawResult := fvm.layerTemp
+
+		for i := 1; i < NumLayers-1; i++ {
+			dx := fvm.layerHeight[i]
+			d2Tdx2 := (fvm.layerTemp[i+1] - 2*fvm.layerTemp[i] + fvm.layerTemp[i-1]) / (dx * dx)
+			rawResult[i] = fvm.layerTemp[i] + thermalDiffusivity*dt*d2Tdx2
+		}
+
+		dx := fvm.layerHeight[0]
+		d2Tdx2 := (fvm.layerTemp[1] - fvm.layerTemp[0]) / (dx * dx)
+		rawResult[0] = fvm.layerTemp[0] + thermalDiffusivity*dt*d2Tdx2*0.5
+
+		dx = fvm.layerHeight[NumLayers-1]
+		d2Tdx2 = (fvm.layerTemp[NumLayers-2] - fvm.layerTemp[NumLayers-1]) / (dx * dx)
+		rawResult[NumLayers-1] = fvm.layerTemp[NumLayers-1] + thermalDiffusivity*dt*d2Tdx2*0.5
+
+		for i := 0; i < NumLayers; i++ {
+			change := rawResult[i] - saved[i]
+			if change > MaxTempChange {
+				change = MaxTempChange
+			} else if change < -MaxTempChange {
+				change = -MaxTempChange
+			}
+			fvm.layerTemp[i] = saved[i] + AlphaTempRelax*change
+		}
+
+		residual := 0.0
+		for i := 0; i < NumLayers; i++ {
+			residual += math.Abs(fvm.layerTemp[i] - prevIter[i])
+		}
+		residual /= float64(NumLayers)
+		fvm.lastResidual = residual
+
+		if residual < ConvergenceTol {
+			break
+		}
+
+		prevIter = fvm.layerTemp
 	}
 
-	dx := fvm.layerHeight[0]
-	d2Tdx2 := (fvm.layerTemp[1] - fvm.layerTemp[0]) / (dx * dx)
-	newTemp[0] = fvm.layerTemp[0] + alpha*dt*d2Tdx2*0.5
-
-	dx = fvm.layerHeight[NumLayers-1]
-	d2Tdx2 = (fvm.layerTemp[NumLayers-2] - fvm.layerTemp[NumLayers-1]) / (dx * dx)
-	newTemp[NumLayers-1] = fvm.layerTemp[NumLayers-1] + alpha*dt*d2Tdx2*0.5
-
-	fvm.layerTemp = newTemp
+	for i := 0; i < NumLayers; i++ {
+		fvm.layerTemp[i] = math.Max(-170, math.Min(-150, fvm.layerTemp[i]))
+	}
 }
 
-func (fvm *FiniteVolumeModel) solveMassDiffusion() {
-	dt := fvm.timeStep
+func (fvm *FiniteVolumeModel) solveMassDiffusionAdaptive() {
 	dEff := 1e-9
 
-	newDensity := fvm.layerDensity
+	dt := fvm.computeAdaptiveTimeStep(dEff)
+	subDt := math.Min(dt, fvm.effectiveTimeStep)
 
-	for i := 1; i < NumLayers-1; i++ {
-		dx := fvm.layerHeight[i]
-		d2Rhodx2 := (fvm.layerDensity[i+1] - 2*fvm.layerDensity[i] + fvm.layerDensity[i-1]) / (dx * dx)
-		newDensity[i] = fvm.layerDensity[i] + dEff*dt*d2Rhodx2
+	saved := fvm.layerDensity
+	prevIter := fvm.layerDensity
+
+	for iter := 0; iter < MaxSubIterations; iter++ {
+		rawResult := fvm.layerDensity
+
+		for i := 1; i < NumLayers-1; i++ {
+			dx := fvm.layerHeight[i]
+			d2Rhodx2 := (fvm.layerDensity[i+1] - 2*fvm.layerDensity[i] + fvm.layerDensity[i-1]) / (dx * dx)
+			rawResult[i] = fvm.layerDensity[i] + dEff*subDt*d2Rhodx2
+		}
+
+		dx := fvm.layerHeight[0]
+		d2Rhodx2 := (fvm.layerDensity[1] - fvm.layerDensity[0]) / (dx * dx)
+		rawResult[0] = fvm.layerDensity[0] + dEff*subDt*d2Rhodx2*0.5
+
+		dx = fvm.layerHeight[NumLayers-1]
+		d2Rhodx2 = (fvm.layerDensity[NumLayers-2] - fvm.layerDensity[NumLayers-1]) / (dx * dx)
+		rawResult[NumLayers-1] = fvm.layerDensity[NumLayers-1] + dEff*subDt*d2Rhodx2*0.5
+
+		for i := 0; i < NumLayers; i++ {
+			change := rawResult[i] - saved[i]
+			if change > MaxDensityChange {
+				change = MaxDensityChange
+			} else if change < -MaxDensityChange {
+				change = -MaxDensityChange
+			}
+			fvm.layerDensity[i] = saved[i] + AlphaDensityRelax*change
+		}
+
+		residual := 0.0
+		for i := 0; i < NumLayers; i++ {
+			residual += math.Abs(fvm.layerDensity[i] - prevIter[i])
+		}
+		residual /= float64(NumLayers)
+
+		if residual < ConvergenceTol {
+			break
+		}
+
+		prevIter = fvm.layerDensity
 	}
 
-	dx := fvm.layerHeight[0]
-	d2Rhodx2 := (fvm.layerDensity[1] - fvm.layerDensity[0]) / (dx * dx)
-	newDensity[0] = fvm.layerDensity[0] + dEff*dt*d2Rhodx2*0.5
-
-	dx = fvm.layerHeight[NumLayers-1]
-	d2Rhodx2 = (fvm.layerDensity[NumLayers-2] - fvm.layerDensity[NumLayers-1]) / (dx * dx)
-	newDensity[NumLayers-1] = fvm.layerDensity[NumLayers-1] + dEff*dt*d2Rhodx2*0.5
-
-	fvm.layerDensity = newDensity
+	for i := 0; i < NumLayers; i++ {
+		fvm.layerDensity[i] = math.Max(440, math.Min(470, fvm.layerDensity[i]))
+	}
 }
 
 func (fvm *FiniteVolumeModel) computeInstabilityDriftRate() float64 {

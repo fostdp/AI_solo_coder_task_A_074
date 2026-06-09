@@ -7,8 +7,44 @@ const Tank3D = {
     raycaster: null,
     mouse: null,
     animFrame: null,
+    isMobile: false,
+    qualityLevel: 'high',
+
+    detectDeviceCapability() {
+        const ua = navigator.userAgent.toLowerCase();
+        const isMobileUA = /android|iphone|ipad|ipod|mobile/.test(ua);
+        const isLowMem = navigator.deviceMemory !== undefined && navigator.deviceMemory <= 4;
+        const isLowCore = navigator.hardwareConcurrency !== undefined && navigator.hardwareConcurrency <= 4;
+        const isTouchDevice = 'ontouchstart' in window;
+
+        this.isMobile = isMobileUA || isTouchDevice || isLowMem;
+
+        if (isLowMem || (this.isMobile && isLowCore)) {
+            this.qualityLevel = 'low';
+        } else if (this.isMobile) {
+            this.qualityLevel = 'medium';
+        } else {
+            this.qualityLevel = 'high';
+        }
+
+        log('Tank3D: device detected mobile=' + this.isMobile + ' quality=' + this.qualityLevel);
+    },
+
+    getGeometryParams() {
+        switch (this.qualityLevel) {
+            case 'low':
+                return { cylinderSegs: 8, sphereSegs: 4, coneSegs: 4, pixelRatioCap: 1.0, enableEdges: false, enableShell: false, enableRoof: false };
+            case 'medium':
+                return { cylinderSegs: 16, sphereSegs: 6, coneSegs: 6, pixelRatioCap: 1.5, enableEdges: false, enableShell: true, enableRoof: false };
+            default:
+                return { cylinderSegs: 32, sphereSegs: 10, coneSegs: 8, pixelRatioCap: 2.0, enableEdges: true, enableShell: true, enableRoof: true };
+        }
+    },
 
     init() {
+        this.detectDeviceCapability();
+        const gp = this.getGeometryParams();
+
         const container = document.getElementById('three-container');
         const canvas = document.getElementById('tank-3d');
 
@@ -19,17 +55,25 @@ const Tank3D = {
         this.camera.position.set(8, 6, 12);
         this.camera.lookAt(0, 3, 0);
 
-        this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+        const pixelRatio = Math.min(window.devicePixelRatio, gp.pixelRatioCap);
+        this.renderer = new THREE.WebGLRenderer({
+            canvas,
+            antialias: !this.isMobile,
+            powerPreference: this.isMobile ? 'low-power' : 'high-performance',
+        });
         this.renderer.setSize(container.clientWidth, container.clientHeight);
-        this.renderer.setPixelRatio(window.devicePixelRatio);
+        this.renderer.setPixelRatio(pixelRatio);
 
         this.scene.add(new THREE.AmbientLight(0x404060, 0.6));
         const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
         dirLight.position.set(10, 15, 10);
         this.scene.add(dirLight);
-        const pointLight = new THREE.PointLight(0x06b6d4, 0.5, 30);
-        pointLight.position.set(0, 8, 0);
-        this.scene.add(pointLight);
+
+        if (!this.isMobile) {
+            const pointLight = new THREE.PointLight(0x06b6d4, 0.5, 30);
+            pointLight.position.set(0, 8, 0);
+            this.scene.add(pointLight);
+        }
 
         this.raycaster = new THREE.Raycaster();
         this.mouse = new THREE.Vector2();
@@ -54,10 +98,44 @@ const Tank3D = {
         canvas.addEventListener('mousemove', (e) => {
             if (!isDragging || !this.tankGroup) return;
             const dx = e.clientX - prevX;
-            const dy = e.clientY - prevY;
             this.tankGroup.rotation.y += dx * 0.005;
             prevX = e.clientX;
             prevY = e.clientY;
+        });
+
+        let touchStartX = 0;
+        canvas.addEventListener('touchstart', (e) => {
+            if (e.touches.length === 1) {
+                touchStartX = e.touches[0].clientX;
+            }
+        }, { passive: true });
+        canvas.addEventListener('touchmove', (e) => {
+            if (e.touches.length === 1 && this.tankGroup) {
+                const dx = e.touches[0].clientX - touchStartX;
+                this.tankGroup.rotation.y += dx * 0.005;
+                touchStartX = e.touches[0].clientX;
+            }
+        }, { passive: true });
+        canvas.addEventListener('touchend', (e) => {
+            if (e.changedTouches.length === 1) {
+                const touch = e.changedTouches[0];
+                const rect = container.getBoundingClientRect();
+                this.mouse.x = ((touch.clientX - rect.left) / rect.width) * 2 - 1;
+                this.mouse.y = -((touch.clientY - rect.top) / rect.height) * 2 + 1;
+                this.raycaster.setFromCamera(this.mouse, this.camera);
+                const intersects = this.raycaster.intersectObjects(this.sensorMarkers);
+                if (intersects.length > 0) {
+                    const obj = intersects[0].object;
+                    const data = obj.userData;
+                    if (data.sensorId) {
+                        showSensorPopup(data.sensorId, data.sensorType, touch.clientX, touch.clientY);
+                    } else if (data.sensorType === 'density') {
+                        showDensityPopup(data.layerIndex, data.value, touch.clientX, touch.clientY);
+                    } else if (data.sensorType === 'pressure') {
+                        showPressurePopup(data.value, touch.clientX, touch.clientY);
+                    }
+                }
+            }
         });
 
         window.addEventListener('resize', () => {
@@ -66,22 +144,45 @@ const Tank3D = {
             this.renderer.setSize(container.clientWidth, container.clientHeight);
         });
 
+        if (this.isMobile) {
+            this.setupVisibilityHandling();
+        }
+
         this.animate();
     },
 
+    setupVisibilityHandling() {
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                if (this.animFrame) {
+                    cancelAnimationFrame(this.animFrame);
+                    this.animFrame = null;
+                }
+            } else {
+                if (!this.animFrame) {
+                    this.animate();
+                }
+            }
+        });
+    },
+
     createBaseEnvironment() {
-        const gridHelper = new THREE.GridHelper(20, 20, 0x2a3a52, 0x1a2332);
+        const gridSize = this.isMobile ? 10 : 20;
+        const gridDiv = this.isMobile ? 10 : 20;
+        const gridHelper = new THREE.GridHelper(gridSize, gridDiv, 0x2a3a52, 0x1a2332);
         gridHelper.position.y = -0.01;
         this.scene.add(gridHelper);
     },
 
     updateTank(data) {
         if (this.tankGroup) {
+            this.disposeGroup(this.tankGroup);
             this.scene.remove(this.tankGroup);
         }
         this.tankGroup = new THREE.Group();
         this.sensorMarkers = [];
 
+        const gp = this.getGeometryParams();
         const tankHeight = 7.6;
         const tankRadius = 3.0;
         const numLayers = 5;
@@ -90,42 +191,46 @@ const Tank3D = {
         const temperatures = data.temperatures || [];
         const densities = data.densities || [];
 
+        const sharedCylGeom = new THREE.CylinderGeometry(tankRadius, tankRadius, layerH, gp.cylinderSegs, 1, false);
+
         for (let i = 0; i < numLayers; i++) {
             const layerData = temperatures.find(l => l.layer_index === i + 1);
             const avgTemp = layerData ? layerData.avg_temp : -162;
             const color = new THREE.Color(this.tempToHex(avgTemp));
 
-            const layerGeom = new THREE.CylinderGeometry(tankRadius, tankRadius, layerH, 32, 1, false);
             const layerMat = new THREE.MeshPhongMaterial({
                 color: color,
                 transparent: true,
                 opacity: 0.7,
-                shininess: 60,
+                shininess: this.isMobile ? 20 : 60,
             });
-            const layerMesh = new THREE.Mesh(layerGeom, layerMat);
+            const layerMesh = new THREE.Mesh(sharedCylGeom, layerMat);
             layerMesh.position.y = i * layerH + layerH / 2;
             this.tankGroup.add(layerMesh);
 
-            const edgeGeom = new THREE.EdgesGeometry(layerGeom);
-            const edgeMat = new THREE.LineBasicMaterial({ color: 0x3b82f6, transparent: true, opacity: 0.4 });
-            const edges = new THREE.LineSegments(edgeGeom, edgeMat);
-            edges.position.copy(layerMesh.position);
-            this.tankGroup.add(edges);
+            if (gp.enableEdges) {
+                const edgeGeom = new THREE.EdgesGeometry(sharedCylGeom);
+                const edgeMat = new THREE.LineBasicMaterial({ color: 0x3b82f6, transparent: true, opacity: 0.4 });
+                const edges = new THREE.LineSegments(edgeGeom, edgeMat);
+                edges.position.copy(layerMesh.position);
+                this.tankGroup.add(edges);
+            }
 
             if (layerData && layerData.sensors) {
+                const sharedSphereGeom = new THREE.SphereGeometry(0.08, gp.sphereSegs, gp.sphereSegs);
+
                 layerData.sensors.forEach((sensor, si) => {
                     const angle = (si / 8) * Math.PI * 2;
                     const sx = Math.cos(angle) * (tankRadius * 0.85);
                     const sz = Math.sin(angle) * (tankRadius * 0.85);
                     const sy = i * layerH + layerH / 2;
 
-                    const markerGeom = new THREE.SphereGeometry(0.08, 12, 12);
                     const markerMat = new THREE.MeshPhongMaterial({
                         color: 0xffffff,
                         emissive: color,
                         emissiveIntensity: 0.6,
                     });
-                    const marker = new THREE.Mesh(markerGeom, markerMat);
+                    const marker = new THREE.Mesh(sharedSphereGeom, markerMat);
                     marker.position.set(sx, sy, sz);
                     marker.userData = {
                         sensorId: sensor.sensor_id,
@@ -146,6 +251,8 @@ const Tank3D = {
             { layer: 5, angle: Math.PI * 4 / 3 },
         ];
 
+        const sharedOctGeom = new THREE.OctahedronGeometry(0.12, 0);
+
         densities.forEach((d, di) => {
             if (di >= densityPositions.length) return;
             const pos = densityPositions[di];
@@ -154,14 +261,13 @@ const Tank3D = {
             const dx = Math.cos(pos.angle) * (tankRadius * 0.5);
             const dz = Math.sin(pos.angle) * (tankRadius * 0.5);
 
-            const markerGeom = new THREE.OctahedronGeometry(0.12, 0);
             const densColor = new THREE.Color(this.densityToHex(d.value_kg_m3));
             const markerMat = new THREE.MeshPhongMaterial({
                 color: 0xffffff,
                 emissive: densColor,
                 emissiveIntensity: 0.8,
             });
-            const marker = new THREE.Mesh(markerGeom, markerMat);
+            const marker = new THREE.Mesh(sharedOctGeom, markerMat);
             marker.position.set(dx, sy, dz);
             marker.userData = {
                 sensorId: null,
@@ -173,30 +279,33 @@ const Tank3D = {
             this.sensorMarkers.push(marker);
         });
 
-        const shellGeom = new THREE.CylinderGeometry(tankRadius + 0.05, tankRadius + 0.05, tankHeight + 0.1, 32, 1, true);
-        const shellMat = new THREE.MeshPhongMaterial({
-            color: 0x4488aa,
-            transparent: true,
-            opacity: 0.12,
-            side: THREE.DoubleSide,
-            wireframe: false,
-        });
-        const shell = new THREE.Mesh(shellGeom, shellMat);
-        shell.position.y = tankHeight / 2;
-        this.tankGroup.add(shell);
+        if (gp.enableShell) {
+            const shellGeom = new THREE.CylinderGeometry(tankRadius + 0.05, tankRadius + 0.05, tankHeight + 0.1, gp.cylinderSegs, 1, true);
+            const shellMat = new THREE.MeshPhongMaterial({
+                color: 0x4488aa,
+                transparent: true,
+                opacity: 0.12,
+                side: THREE.DoubleSide,
+            });
+            const shell = new THREE.Mesh(shellGeom, shellMat);
+            shell.position.y = tankHeight / 2;
+            this.tankGroup.add(shell);
+        }
 
-        const roofGeom = new THREE.SphereGeometry(tankRadius + 0.05, 32, 16, 0, Math.PI * 2, 0, Math.PI / 2);
-        const roofMat = new THREE.MeshPhongMaterial({
-            color: 0x5599bb,
-            transparent: true,
-            opacity: 0.15,
-            side: THREE.DoubleSide,
-        });
-        const roof = new THREE.Mesh(roofGeom, roofMat);
-        roof.position.y = tankHeight;
-        this.tankGroup.add(roof);
+        if (gp.enableRoof) {
+            const roofGeom = new THREE.SphereGeometry(tankRadius + 0.05, gp.cylinderSegs, Math.floor(gp.cylinderSegs / 2), 0, Math.PI * 2, 0, Math.PI / 2);
+            const roofMat = new THREE.MeshPhongMaterial({
+                color: 0x5599bb,
+                transparent: true,
+                opacity: 0.15,
+                side: THREE.DoubleSide,
+            });
+            const roof = new THREE.Mesh(roofGeom, roofMat);
+            roof.position.y = tankHeight;
+            this.tankGroup.add(roof);
+        }
 
-        const pressureMarkerGeom = new THREE.ConeGeometry(0.15, 0.3, 8);
+        const pressureMarkerGeom = new THREE.ConeGeometry(0.15, 0.3, gp.coneSegs);
         const pressureMarkerMat = new THREE.MeshPhongMaterial({
             color: 0x3b82f6,
             emissive: 0x1e40af,
@@ -213,6 +322,21 @@ const Tank3D = {
 
         this.tankGroup.position.set(0, 0, 0);
         this.scene.add(this.tankGroup);
+    },
+
+    disposeGroup(group) {
+        group.traverse((obj) => {
+            if (obj.geometry) {
+                obj.geometry.dispose();
+            }
+            if (obj.material) {
+                if (Array.isArray(obj.material)) {
+                    obj.material.forEach(m => m.dispose());
+                } else {
+                    obj.material.dispose();
+                }
+            }
+        });
     },
 
     onClick(event) {
@@ -298,3 +422,9 @@ const Tank3D = {
         return (r << 16) | (g << 8) | b;
     }
 };
+
+function log(msg) {
+    if (typeof console !== 'undefined') {
+        console.log('[Tank3D] ' + msg);
+    }
+}
